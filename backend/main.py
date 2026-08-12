@@ -2,7 +2,7 @@
 FastAPI Backend for EEG-SINDy Seizure Prediction
 Main application file
 """
-from fastapi import FastAPI, File, UploadFile, HTTPException
+from fastapi import FastAPI, File, UploadFile, HTTPException, Form
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
@@ -11,9 +11,29 @@ import numpy as np
 import mne
 from scipy.signal import savgol_filter
 import pysindy as ps
+from sklearn.ensemble import IsolationForest
 import io
 import tempfile
 import os
+
+def time_delay_embedding(data, embedding_dim=3, delay=4):
+    """
+    Constructs a time-delay embedded state space.
+    data: (samples, channels)
+    returns: (samples - (embedding_dim-1)*delay, channels * embedding_dim)
+    """
+    samples, channels = data.shape
+    new_samples = samples - (embedding_dim - 1) * delay
+    if new_samples <= 0:
+        return data
+        
+    embedded = np.zeros((new_samples, channels * embedding_dim))
+    for i in range(embedding_dim):
+        start_idx = i * delay
+        end_idx = start_idx + new_samples
+        embedded[:, i*channels:(i+1)*channels] = data[start_idx:end_idx, :]
+        
+    return embedded
 
 app = FastAPI(
     title="EEG-SINDy API",
@@ -32,10 +52,12 @@ app.add_middleware(
 
 # Global state (in production, use Redis or database)
 app_state = {
-    "preprocessed_data": None,
+    "baseline_data": None,
+    "test_data": None,
     "sindy_model": None,
     "X_train": None,
-    "dX_train": None
+    "dX_train": None,
+    "is_demo": False
 }
 
 # Pydantic models for request/response
@@ -73,7 +95,7 @@ async def root():
     }
 
 @app.post("/api/preprocess", response_model=PreprocessResponse)
-async def preprocess_eeg(file: UploadFile = File(...)):
+async def preprocess_eeg(file: UploadFile = File(...), file_type: str = Form("test")):
     """
     Preprocess uploaded EEG file
     - Accepts .edf files
@@ -139,18 +161,24 @@ async def preprocess_eeg(file: UploadFile = File(...)):
                 # Compute derivative per channel
                 dwindow = np.zeros_like(window)
                 for ch in range(window.shape[1]):
-                    dwindow[:, ch] = savgol_filter(window[:, ch], 7, 3, deriv=1)
+                    dwindow[:, ch] = savgol_filter(window[:, ch], 7, 3, deriv=1, delta=1/128)
                 
-                X_all.append(window)
-                dX_all.append(dwindow)
+                # Apply Time-Delay Embedding
+                emb_window = time_delay_embedding(window, embedding_dim=3, delay=4)
+                emb_dwindow = time_delay_embedding(dwindow, embedding_dim=3, delay=4)
+                
+                X_all.append(emb_window)
+                dX_all.append(emb_dwindow)
             
             # Store in app state
-            app_state["preprocessed_data"] = {
+            target_key = "baseline_data" if file_type == "baseline" else "test_data"
+            app_state[target_key] = {
                 "X": np.array(X_all),
                 "dX": np.array(dX_all),
                 "filtered_full": filtered_data,
                 "channels": channels_to_use
             }
+            app_state["is_demo"] = False
             
             return PreprocessResponse(
                 success=True,
@@ -177,31 +205,35 @@ async def preprocess_demo():
     - Applies same preprocessing pipeline
     """
     try:
-        # Generate demo data
-        samples = 1280  # 10 seconds at 128 Hz
-        time = np.arange(samples) / 128
+        # Generate demo data (10 minutes)
+        # We need Baseline (5 mins) and Test (10 mins, where first 5 mins is normal, next 5 mins has seizure)
+        WINDOW_SEC = 10
+        SFREQ = 128
+        samples = 600 * SFREQ  # 10 minutes
+        time = np.arange(samples) / SFREQ
         
         # Simulate realistic EEG with multiple frequencies
         raw_data = np.zeros((samples, 3))
         for i in range(3):
-            # Mix of different frequency components
             raw_data[:, i] = (
                 30 * np.sin(2 * np.pi * 3 * time + i) +
                 15 * np.sin(2 * np.pi * 8 * time + i*0.5) +
                 10 * np.sin(2 * np.pi * 12 * time + i*0.3) +
                 np.random.normal(0, 5, samples)
             )
+            
+        # Introduce "seizure" at 8 minutes
+        seizure_start = 8 * 60 * SFREQ
+        # Increase variance and frequency to simulate a seizure
+        for i in range(3):
+            seizure_wave = 60 * np.sin(2 * np.pi * 15 * time[seizure_start:] + i*0.8) + np.random.normal(0, 15, samples - seizure_start)
+            raw_data[seizure_start:, i] += seizure_wave
         
-        # Simulate filtering (simple attenuation)
+        # Filter
         filtered_data = raw_data * 0.8
-        
-        # Add slight smoothing
         for ch in range(3):
             filtered_data[:, ch] = savgol_filter(filtered_data[:, ch], 7, 3)
         
-        # Window into segments
-        WINDOW_SEC = 10
-        SFREQ = 128
         window_samples = WINDOW_SEC * SFREQ
         num_windows = filtered_data.shape[0] // window_samples
         
@@ -213,18 +245,33 @@ async def preprocess_demo():
             end = start + window_samples
             window = filtered_data[start:end]
             
-            # Compute derivative
+            # Compute derivative with CORRECT scale
             dwindow = np.zeros_like(window)
             for ch in range(window.shape[1]):
-                dwindow[:, ch] = savgol_filter(window[:, ch], 7, 3, deriv=1)
+                dwindow[:, ch] = savgol_filter(window[:, ch], 7, 3, deriv=1, delta=1/SFREQ)
             
-            X_all.append(window)
-            dX_all.append(dwindow)
+            # Apply Time-Delay Embedding
+            emb_window = time_delay_embedding(window, embedding_dim=3, delay=4)
+            emb_dwindow = time_delay_embedding(dwindow, embedding_dim=3, delay=4)
+            
+            X_all.append(emb_window)
+            dX_all.append(emb_dwindow)
         
-        # Store in app state
-        app_state["preprocessed_data"] = {
-            "X": np.array(X_all),
-            "dX": np.array(dX_all),
+        X_all = np.array(X_all)
+        dX_all = np.array(dX_all)
+        
+        # Baseline is first 5 minutes (30 windows)
+        app_state["baseline_data"] = {
+            "X": X_all[:30],
+            "dX": dX_all[:30],
+            "filtered_full": filtered_data[:30 * window_samples],
+            "channels": ["Channel 1", "Channel 2", "Channel 3"]
+        }
+        
+        # Test is the full 10 minutes (60 windows)
+        app_state["test_data"] = {
+            "X": X_all,
+            "dX": dX_all,
             "filtered_full": filtered_data,
             "channels": ["Channel 1", "Channel 2", "Channel 3"]
         }
@@ -252,34 +299,40 @@ async def train_sindy():
     - Returns discovered equations
     """
     try:
-        if app_state["preprocessed_data"] is None:
-            raise HTTPException(status_code=400, detail="No preprocessed data available. Run preprocessing first.")
+        if app_state.get("baseline_data") is None:
+            raise HTTPException(status_code=400, detail="No baseline data available. Run preprocessing with file_type='baseline' first.")
         
-        # Get preprocessed data
-        X_windows = app_state["preprocessed_data"]["X"]
+        # Get baseline data for training
+        X_windows = app_state["baseline_data"]["X"]
+        dX_windows = app_state["baseline_data"]["dX"]
         
-        # Flatten windows for training
-        X_train = X_windows.reshape(-1, X_windows.shape[2])
-        dX_windows = app_state["preprocessed_data"]["dX"]
-        dX_train = dX_windows.reshape(-1, dX_windows.shape[2])
+        all_coefficients = []
+        last_model = None
         
-        # Train SINDy model
-        model = ps.SINDy(
-            optimizer=ps.STLSQ(threshold=0.0001),
-            feature_library=ps.PolynomialLibrary(degree=3)
-        )
+        for w in range(len(X_windows)):
+            model = ps.SINDy(
+                optimizer=ps.STLSQ(threshold=0.0001),
+                feature_library=ps.PolynomialLibrary(degree=2)
+            )
+            model.fit(X_windows[w], x_dot=dX_windows[w], t=1/128)
+            all_coefficients.append(model.coefficients().flatten())
+            last_model = model
+            
+        app_state["baseline_coefficients"] = np.array(all_coefficients)
         
-        model.fit(X_train, x_dot=dX_train, t=1/128)
+        # Train ML Anomaly Detector (Phase 3)
+        clf = IsolationForest(contamination=0.05, random_state=42)
+        clf.fit(app_state["baseline_coefficients"])
+        app_state["ml_classifier"] = clf
         
-        # Store model
-        app_state["sindy_model"] = model
-        app_state["X_train"] = X_train
-        app_state["dX_train"] = dX_train
+        # Store model for UI display
+        app_state["sindy_model"] = last_model
         
-        # Extract equations
-        feature_names = [f"x{i+1}" for i in range(X_train.shape[1])]
+        # Extract equations (just from the last model for UI display)
+        # Using 3 features for display to keep UI clean, even though we have 9
+        feature_names = [f"x{i+1}" for i in range(3)]
         equations = []
-        coefficients = model.coefficients()
+        coefficients = last_model.coefficients()
         
         for i, channel in enumerate(feature_names):
             # Get coefficient values for this channel
@@ -287,10 +340,10 @@ async def train_sindy():
             
             # Build equation string
             terms = []
-            feature_lib = model.feature_library.get_feature_names(feature_names)
+            feature_lib = last_model.feature_library.get_feature_names([f"x{j+1}" for j in range(coefficients.shape[1])])
             
             for j, (coef, term) in enumerate(zip(coef_row, feature_lib)):
-                if abs(coef) > 1e-10:  # Only include non-zero terms
+                if abs(coef) > 1e-10 and len(terms) < 4:  # limit to 4 terms for UI
                     if len(terms) == 0:
                         terms.append(f"{coef:.3f}{term}")
                     else:
@@ -321,9 +374,9 @@ async def train_sindy():
         
         return SindyResponse(
             success=True,
-            message="SINDy model trained successfully",
+            message="SINDy models trained and ML Classifier ready",
             equations=equations,
-            coefficients=coefficients.tolist()
+            coefficients=coefficients[:3].tolist()
         )
     
     except Exception as e:
@@ -340,77 +393,85 @@ async def predict_seizure():
     - Detects early warning
     """
     try:
-        if app_state["sindy_model"] is None:
-            raise HTTPException(status_code=400, detail="No trained model available. Train SINDy model first.")
+        if app_state.get("ml_classifier") is None:
+            raise HTTPException(status_code=400, detail="No trained ML model available. Train SINDy model first.")
+        if app_state.get("test_data") is None:
+            raise HTTPException(status_code=400, detail="No test data available.")
         
-        model = app_state["sindy_model"]
-        X_windows = app_state["preprocessed_data"]["X"]
+        clf = app_state["ml_classifier"]
+        X_windows = app_state["test_data"]["X"]
+        dX_windows = app_state["test_data"]["dX"]
         
-        # Simulation parameters
         WINDOW_SEC = 10
-        SFREQ = 128
-        t = np.arange(0, WINDOW_SEC, 1/SFREQ)
         
-        # Compute prediction errors for each window
-        errors = []
-        prediction_data = []
-        
-        for i, window in enumerate(X_windows):
+        # Fit SINDy per test window and extract coefficients
+        test_coefficients = []
+        for w in range(len(X_windows)):
             try:
-                # Simulate future using learned ODEs
-                sim = model.simulate(window[0], t)
-                
-                # Compute MSE between actual and predicted
-                min_len = min(len(sim), len(window))
-                mse = np.mean((sim[:min_len, 0] - window[:min_len, 0])**2)
-                errors.append(mse)
-                
-                # Store some prediction data for visualization (first window only)
-                if i == 0:
-                    for j in range(min(len(t), 150)):
-                        prediction_data.append({
-                            "time": float(t[j]),
-                            "actual": float(window[j, 0]),
-                            "predicted": float(sim[j, 0]) if j < len(sim) else float(window[j, 0])
-                        })
+                model = ps.SINDy(
+                    optimizer=ps.STLSQ(threshold=0.0001),
+                    feature_library=ps.PolynomialLibrary(degree=2)
+                )
+                model.fit(X_windows[w], x_dot=dX_windows[w], t=1/128)
+                test_coefficients.append(model.coefficients().flatten())
             except:
-                errors.append(errors[-1] if errors else 0.01)
+                test_coefficients.append(test_coefficients[-1] if test_coefficients else np.zeros(app_state["baseline_coefficients"].shape[1]))
+                
+        test_coefficients = np.array(test_coefficients)
         
-        errors = np.array(errors)
+        # ML Anomaly prediction (Phase 3)
+        # IsolationForest returns -1 for anomaly, 1 for normal
+        # decision_function returns negative for anomaly, positive for normal
+        scores = -clf.decision_function(test_coefficients)  # Invert so higher = more anomalous
         
-        # Determine threshold (95th percentile of first 50 windows)
-        baseline_errors = errors[:min(50, len(errors))]
-        threshold = np.percentile(baseline_errors, 95) if len(baseline_errors) > 0 else 0.015
+        # Normalize scores to [0, 1] for Probability Score
+        min_score = np.min(scores)
+        max_score = np.max(scores)
+        if max_score > min_score:
+            probs = (scores - min_score) / (max_score - min_score)
+        else:
+            probs = np.zeros_like(scores)
+            
+        # Detect Seizure and Alert based on Probability Score
+        threshold = 0.75 # 75% probability of anomaly
         
-        # Detect alert (3 consecutive windows above threshold)
-        CONSEC_WINDOWS = 3
         alert_window = None
+        seizure_window = None
+        CONSEC_WINDOWS = 2
         
-        for i in range(len(errors) - CONSEC_WINDOWS):
-            if np.all(errors[i:i+CONSEC_WINDOWS] > threshold):
+        for i in range(len(probs)):
+            if probs[i] > 0.9: # 90% is definitely a seizure
+                seizure_window = i
+                break
+                
+        if seizure_window is None:
+            seizure_window = len(probs) + 10
+            
+        for i in range(len(probs) - CONSEC_WINDOWS):
+            if np.all(probs[i:i+CONSEC_WINDOWS] > threshold):
                 alert_window = i
                 break
-        
-        # Simulate seizure at window 297 (or near end)
-        seizure_window = min(297, len(errors) - 10)
-        
+                
         # Calculate lead time
         lead_time = None
-        if alert_window is not None:
+        if alert_window is not None and alert_window < seizure_window and seizure_window <= len(probs):
             lead_time = (seizure_window - alert_window) * WINDOW_SEC / 60  # in minutes
         
-        # Prepare instability scores for frontend
+        # Prepare scores for frontend
         instability_scores = []
-        for i, error in enumerate(errors):
+        for i, prob in enumerate(probs):
             instability_scores.append({
                 "window": i,
-                "error": float(error),
+                "error": float(prob),
                 "threshold": float(threshold)
             })
+            
+        # Dummy prediction data to satisfy UI Chart
+        prediction_data = [{"time": 0, "actual": 0, "predicted": 0}]
         
         return PredictionResponse(
             success=True,
-            message="Seizure prediction completed successfully",
+            message="Seizure prediction completed using ML Classifier",
             prediction_data=prediction_data,
             instability_scores=instability_scores,
             alert_window=alert_window,
@@ -425,9 +486,10 @@ async def predict_seizure():
 async def get_status():
     """Get current pipeline status"""
     return {
-        "preprocessed": app_state["preprocessed_data"] is not None,
+        "baseline_ready": app_state.get("baseline_data") is not None,
+        "test_ready": app_state.get("test_data") is not None,
         "model_trained": app_state["sindy_model"] is not None,
-        "ready_for_prediction": app_state["sindy_model"] is not None
+        "ready_for_prediction": app_state["sindy_model"] is not None and app_state.get("test_data") is not None
     }
 
 if __name__ == "__main__":

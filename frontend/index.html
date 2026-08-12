@@ -370,13 +370,23 @@
             <p>Upload your EEG Data (.edf) to detect early warning signs using Sparse Identification of Nonlinear
                 Dynamics.</p>
 
-            <div class="upload-container">
-                <div class="drop-zone glass" id="dropZone">
-                    <input type="file" id="fileInput" accept=".edf" onchange="handleFileSelect(event)">
+            <div class="upload-container" style="display: flex; gap: 2rem;">
+                <div class="drop-zone glass" id="dropZoneBaseline" style="flex: 1;">
+                    <input type="file" id="fileInputBaseline" accept=".edf" onchange="handleBaselineSelect(event)">
                     <div class="icon-cloud">☁️</div>
-                    <h3 style="margin-bottom: 0.5rem;">Click or Drag & Drop EEG File</h3>
-                    <p style="color: var(--text-muted); font-size: 0.9rem;">Supports .EDF format (CHB-MIT Standard)</p>
+                    <h3 style="margin-bottom: 0.5rem;">1. Upload Baseline EEG</h3>
+                    <p style="color: var(--text-muted); font-size: 0.9rem;" id="baselineFileLabel">Supports .EDF format</p>
                 </div>
+                <div class="drop-zone glass" id="dropZoneTest" style="flex: 1;">
+                    <input type="file" id="fileInputTest" accept=".edf" onchange="handleTestSelect(event)">
+                    <div class="icon-cloud">☁️</div>
+                    <h3 style="margin-bottom: 0.5rem;">2. Upload Test EEG</h3>
+                    <p style="color: var(--text-muted); font-size: 0.9rem;" id="testFileLabel">Supports .EDF format</p>
+                </div>
+            </div>
+            <div style="margin-top: 2rem; text-align: center;">
+                <button class="btn btn-primary" id="btnAnalyze" onclick="startAnalysis()" disabled>Analyze Files</button>
+                <button class="btn btn-outline" style="margin-left: 1rem;" onclick="runDemo()">Try Demo Data</button>
             </div>
         </main>
 
@@ -465,38 +475,61 @@
         let instabilityChart = null;
 
 
-        async function handleFileSelect(event) {
+        let baselineFile = null;
+        let testFile = null;
+
+        function checkReadyToAnalyze() {
+            const btn = document.getElementById('btnAnalyze');
+            btn.disabled = !(baselineFile && testFile);
+        }
+
+        async function handleBaselineSelect(event) {
             const file = event.target.files[0];
             if (file && file.name.endsWith('.edf')) {
-                startAnalysis(file);
+                baselineFile = file;
+                document.getElementById('baselineFileLabel').textContent = file.name;
+                checkReadyToAnalyze();
             } else {
-                alert('Please upload a valid .edf file');
+                alert('Please upload a valid .edf file for baseline');
             }
         }
 
+        async function handleTestSelect(event) {
+            const file = event.target.files[0];
+            if (file && file.name.endsWith('.edf')) {
+                testFile = file;
+                document.getElementById('testFileLabel').textContent = file.name;
+                checkReadyToAnalyze();
+            } else {
+                alert('Please upload a valid .edf file for test');
+            }
+        }
 
-
-        async function startAnalysis(file) {
+        async function startAnalysis() {
+            if (!baselineFile || !testFile) return;
             showStatus();
 
             try {
-                // Step 1: Upload & Preprocess
-                updateStep(1, 'Uploading & Processing...', 'Filtering noise and computing derivatives');
+                // Step 1: Upload & Preprocess Baseline
+                updateStep(1, 'Uploading Baseline...', 'Filtering baseline noise and computing derivatives');
+                const formBaseline = new FormData();
+                formBaseline.append('file', baselineFile);
+                formBaseline.append('file_type', 'baseline');
+                let resBase = await fetch(`${API_URL}/api/preprocess`, { method: 'POST', body: formBaseline });
+                if (!resBase.ok) throw new Error('Baseline preprocessing failed');
 
-                const formData = new FormData();
-                formData.append('file', file);
-
-                const prepRes = await fetch(`${API_URL}/api/preprocess`, {
-                    method: 'POST',
-                    body: formData
-                });
-
-                if (!prepRes.ok) throw new Error('Preprocessing failed');
-                const prepData = await prepRes.json();
+                // Step 1b: Upload & Preprocess Test
+                updateStep(1, 'Uploading Test...', 'Filtering test data and computing derivatives');
+                const formTest = new FormData();
+                formTest.append('file', testFile);
+                formTest.append('file_type', 'test');
+                let resTest = await fetch(`${API_URL}/api/preprocess`, { method: 'POST', body: formTest });
+                if (!resTest.ok) throw new Error('Test preprocessing failed');
+                const testData = await resTest.json();
 
                 // Update Stats
-                document.getElementById('channelCount').textContent = prepData.channels;
-                document.getElementById('durationStat').textContent = (prepData.samples / 128).toFixed(1) + 's';
+                document.getElementById('channelCount').textContent = testData.channels;
+                document.getElementById('durationStat').textContent = (testData.samples / 128).toFixed(1) + 's';
 
                 // Continue
                 await runTrainingAndPrediction();
@@ -504,7 +537,27 @@
             } catch (e) {
                 console.error(e);
                 alert('Analysis failed: ' + e.message);
-                window.location.reload(); // Simple reset
+                window.location.reload(); 
+            }
+        }
+
+        async function runDemo() {
+            showStatus();
+            try {
+                updateStep(1, 'Generating Demo Data...', 'Synthesizing 10 mins of multi-frequency EEG with a simulated seizure');
+                let resDemo = await fetch(`${API_URL}/api/preprocess/demo`, { method: 'POST' });
+                if (!resDemo.ok) throw new Error('Demo generation failed');
+                const demoData = await resDemo.json();
+
+                // Update Stats
+                document.getElementById('channelCount').textContent = demoData.channels;
+                document.getElementById('durationStat').textContent = (demoData.samples / 128).toFixed(1) + 's';
+
+                await runTrainingAndPrediction();
+            } catch (e) {
+                console.error(e);
+                alert('Demo failed: ' + e.message);
+                window.location.reload();
             }
         }
 
@@ -683,7 +736,8 @@
                         },
                         y: {
                             grid: { color: 'rgba(255,255,255,0.05)' },
-                            ticks: { color: '#94a3b8' }
+                            ticks: { color: '#94a3b8' },
+                            title: { display: true, text: 'Instability Score (MSE)', color: '#64748b' }
                         }
                     }
                 },
